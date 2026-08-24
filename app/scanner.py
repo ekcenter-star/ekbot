@@ -1,29 +1,22 @@
 """
 scanner.py
-Turns a phone photo of a paper document (consult letter / invoice) into a
-clean, CamScanner-style "scanned" image.
+CamScanner-style document cleaning pipeline.
 
-Pipeline:
-  1. Find the document's 4 corners in the photo
-  2. Perspective-warp it flat (deskew)
-  3. Background normalisation — divide each pixel by the local background
-     estimate (large Gaussian blur). This cancels out shadows, uneven
-     lighting, and the yellow tint of the paper so it reads as white.
-  4. Boost local contrast (CLAHE) so ink is crisp
-  5. Sharpen text edges
-  6. Cap output size so files stay Telegram-friendly
-
-The key improvement over a simple white-balance: the "divide by background"
-trick (sometimes called flat-field correction) is exactly what CamScanner
-uses internally. It handles shadows and colour casts in one shot.
+Steps:
+  1. Find document edges → perspective-warp flat (deskew + crop to paper only)
+  2. Background division  → remove shadows/yellow tint
+  3. Histogram stretch    → push paper brightness to pure white (255)
+  4. CLAHE               → crisp ink without blowing highlights
+  5. Sharpen             → sharp text edges
+  6. Size cap            → Telegram-friendly output
 """
 
 import cv2
 import numpy as np
 
 
-MAX_OUTPUT_DIM = 2000  # cap longest side so files stay Telegram-friendly
-BG_BLUR_SIGMA  = 50   # how large the background estimation kernel is
+MAX_OUTPUT_DIM = 2480   # ~A4 at 200 dpi — big enough for Cliniko, small enough for Telegram
+BG_BLUR_SIGMA  = 60     # larger = smoother background estimate
 
 
 # ---------------------------------------------------------------------------
@@ -31,113 +24,110 @@ BG_BLUR_SIGMA  = 50   # how large the background estimation kernel is
 # ---------------------------------------------------------------------------
 
 def _order_points(pts: np.ndarray) -> np.ndarray:
-    """Order 4 points as top-left, top-right, bottom-right, bottom-left."""
     rect = np.zeros((4, 2), dtype="float32")
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
+    s    = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
     diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
+    rect[1] = pts[np.argmin(diff)] # top-right
+    rect[3] = pts[np.argmax(diff)] # bottom-left
     return rect
 
 
 def _find_document_contour(image: np.ndarray):
-    """Return a 4-point contour for the document, or None if not confident."""
-    h, w = image.shape[:2]
-    ratio = 1000.0 / w if w > 1000 else 1.0
-    small = cv2.resize(image, (int(w * ratio), int(h * ratio)))
+    """Return 4-point document contour or None."""
+    h, w  = image.shape[:2]
+    scale = 800.0 / max(h, w)
+    small = cv2.resize(image, (int(w * scale), int(h * scale)))
 
-    gray    = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged   = cv2.Canny(blurred, 60, 160)
-    edged   = cv2.dilate(edged, np.ones((3, 3), np.uint8), iterations=1)
+    gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    # Bilateral filter preserves edges better than Gaussian for contour finding
+    gray  = cv2.bilateralFilter(gray, 9, 75, 75)
+    edged = cv2.Canny(gray, 30, 120)
+    edged = cv2.dilate(edged, np.ones((5, 5), np.uint8), iterations=2)
 
     contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+    contours     = sorted(contours, key=cv2.contourArea, reverse=True)[:8]
 
-    small_area = small.shape[0] * small.shape[1]
+    img_area = small.shape[0] * small.shape[1]
 
     for c in contours:
         peri  = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         if len(approx) == 4:
             area = cv2.contourArea(approx)
-            if area > 0.35 * small_area:
-                return (approx.reshape(4, 2) / ratio).astype("float32")
+            # Must cover at least 30 % of the frame
+            if area > 0.30 * img_area:
+                return (approx.reshape(4, 2) / scale).astype("float32")
     return None
 
 
 def _warp(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
-    rect = _order_points(pts)
-    (tl, tr, br, bl) = rect
+    rect   = _order_points(pts)
+    tl, tr, br, bl = rect
 
-    width_a  = np.linalg.norm(br - bl)
-    width_b  = np.linalg.norm(tr - tl)
-    max_width = max(int(width_a), int(width_b))
+    w = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
+    h = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
 
-    height_a  = np.linalg.norm(tr - br)
-    height_b  = np.linalg.norm(tl - bl)
-    max_height = max(int(height_a), int(height_b))
-
-    dst = np.array(
-        [[0, 0], [max_width - 1, 0], [max_width - 1, max_height - 1], [0, max_height - 1]],
-        dtype="float32",
-    )
-    m = cv2.getPerspectiveTransform(rect, dst)
-    return cv2.warpPerspective(image, m, (max_width, max_height))
+    dst = np.array([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]], dtype="float32")
+    M   = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, M, (w, h))
 
 
 # ---------------------------------------------------------------------------
-# Enhancement — CamScanner style
+# Enhancement
 # ---------------------------------------------------------------------------
 
-def _normalize_background(image: np.ndarray) -> np.ndarray:
+def _background_divide(image: np.ndarray) -> np.ndarray:
     """
-    Flat-field / background-division correction.
-
-    For each colour channel:
-      normalised = channel / blur(channel, sigma) * 200
-
-    The large Gaussian blur estimates the slow-varying background
-    illumination (paper colour, shadows, yellow tint). Dividing by it
-    removes all of that, leaving only the ink on a uniformly white
-    background — exactly what CamScanner does.
-
-    We keep the full colour image so stamps, signatures, and logos
-    (which may be coloured) remain visible.
+    Flat-field correction: channel / blur(channel) * 255
+    Removes yellow tint, uneven lighting, and shadows entirely.
     """
     img_f  = image.astype(np.float32)
-    result = np.zeros_like(img_f)
-
+    result = np.empty_like(img_f)
     for ch in range(3):
-        channel = img_f[:, :, ch]
-        # Background estimate: very large blur captures illumination, not detail
+        channel    = img_f[:, :, ch]
         background = cv2.GaussianBlur(channel, (0, 0), sigmaX=BG_BLUR_SIGMA)
-        # Divide — removes tint and shadows; scale to keep brightness
-        normalised = channel / (background + 1.0) * 200.0
-        result[:, :, ch] = np.clip(normalised, 0, 255)
+        result[:, :, ch] = np.clip(channel / (background + 1.0) * 255.0, 0, 255)
+    return result.astype(np.uint8)
 
+
+def _stretch_to_white(image: np.ndarray) -> np.ndarray:
+    """
+    Histogram stretch: make the brightest 3 % of pixels pure white (255),
+    darken the darkest 1 % to pure black. This pushes paper to white and
+    ink to black without losing colour in stamps/logos.
+    """
+    gray         = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    p_dark, p_light = np.percentile(gray, [1, 97])
+
+    if p_light <= p_dark:
+        return image  # degenerate image, skip
+
+    scale = 255.0 / (p_light - p_dark)
+    result = np.empty_like(image, dtype=np.float32)
+    for ch in range(3):
+        ch_f = image[:, :, ch].astype(np.float32)
+        result[:, :, ch] = np.clip((ch_f - p_dark) * scale, 0, 255)
     return result.astype(np.uint8)
 
 
 def _boost_contrast(image: np.ndarray) -> np.ndarray:
-    """CLAHE on the luminance channel — crisps up text while keeping colour."""
+    """CLAHE on L channel — local contrast without blowing highlights."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
     l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
 
 def _sharpen(image: np.ndarray) -> np.ndarray:
-    blurred = cv2.GaussianBlur(image, (0, 0), sigmaX=3)
-    return cv2.addWeighted(image, 1.6, blurred, -0.6, 0)
+    blur = cv2.GaussianBlur(image, (0, 0), sigmaX=2)
+    return cv2.addWeighted(image, 1.8, blur, -0.8, 0)
 
 
 def _resize_cap(image: np.ndarray) -> np.ndarray:
-    h, w   = image.shape[:2]
+    h, w    = image.shape[:2]
     longest = max(h, w)
     if longest <= MAX_OUTPUT_DIM:
         return image
@@ -151,32 +141,34 @@ def _resize_cap(image: np.ndarray) -> np.ndarray:
 
 def clean_document(image_bytes: bytes) -> bytes:
     """
-    Main entry point. Takes raw photo bytes, returns cleaned PNG bytes.
-
-    The pipeline produces a CamScanner-style result:
-    - White paper background (yellow/shadow removed)
-    - Crisp, dark ink
-    - Colour preserved (stamps, logos, signatures stay in colour)
+    Takes raw photo bytes → returns cleaned PNG bytes, CamScanner style:
+    - Paper crops tight (perspective-warped if edges found)
+    - Background pure white
+    - Ink dark and crisp
+    - Colour preserved (stamps / logos / signatures stay in colour)
     """
     arr   = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Could not decode image")
 
-    # Step 1 — deskew if document edges are detectable
+    # 1. Deskew + crop to document
     contour = _find_document_contour(image)
     working = _warp(image, contour) if contour is not None else image
 
-    # Step 2 — background normalisation (removes yellow tint, shadows)
-    working = _normalize_background(working)
+    # 2. Remove background colour/tint
+    working = _background_divide(working)
 
-    # Step 3 — local contrast boost
+    # 3. Stretch so paper → white, ink → dark
+    working = _stretch_to_white(working)
+
+    # 4. Local contrast
     working = _boost_contrast(working)
 
-    # Step 4 — sharpen text edges
+    # 5. Sharpen edges
     working = _sharpen(working)
 
-    # Step 5 — cap size
+    # 6. Cap size
     working = _resize_cap(working)
 
     ok, buf = cv2.imencode(".png", working)
