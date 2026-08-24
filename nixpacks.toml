@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python312", "libgcc"]
+nixPkgs = ["python312", "zlib", "glib", "libGL", "libGLU"]
 
 [start]
 cmd = "python app/main.py"
