@@ -31,7 +31,7 @@ from telegram.ext import (
 )
 
 from scanner import clean_document
-from greetings import pick_greeting
+from greetings import pick_greeting, pick_feedback
 from gemini_ocr import extract_text
 
 load_dotenv()
@@ -134,19 +134,36 @@ async def handle_photo_mention(update: Update, context: ContextTypes.DEFAULT_TYP
         file = await context.bot.get_file(tg_photo.file_id)
         photo_bytes = bytes(await file.download_as_bytearray())
 
-        # Step 1 — clean the image with OpenCV
-        cleaned_bytes = clean_document(photo_bytes)
+        # Step 1 — clean the image and detect if letter was found
+        cleaned_bytes, letter_found = clean_document(photo_bytes)
 
+        if not letter_found:
+            # Letter too far / out of frame — send voice feedback
+            logger.info("[photo-handler] Letter not detected — sending feedback voice")
+            feedback = pick_feedback()
+            if feedback:
+                await context.bot.send_chat_action(
+                    chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_VOICE
+                )
+                with open(feedback, "rb") as f:
+                    await message.reply_voice(voice=f)
+            else:
+                await message.reply_text(
+                    "📸 Letter not found in frame — please retake the photo closer to the letter."
+                )
+            return
+
+        # Step 2 — send cleaned image
         sent = await message.reply_photo(
             photo=cleaned_bytes,
             caption="✅ Cleaned up and ready to attach in Cliniko.",
         )
 
-        # Step 2 — extract text with Gemini Pro (if API key is configured)
+        # Step 3 — Gemini Pro OCR (if API key configured)
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id, action=ChatAction.TYPING
         )
-        ocr_text = extract_text(photo_bytes)  # use original for best OCR accuracy
+        ocr_text = extract_text(photo_bytes)
         if ocr_text:
             await sent.reply_text(
                 f"📝 *Extracted text:*\n\n{ocr_text}",
@@ -158,6 +175,7 @@ async def handle_photo_mention(update: Update, context: ContextTypes.DEFAULT_TYP
         await message.reply_text(
             "⚠️ Sorry, I couldn't clean that image up. Try a clearer / better-lit photo of the letter."
         )
+
 
 
 def main() -> None:

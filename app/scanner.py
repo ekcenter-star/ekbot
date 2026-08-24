@@ -219,26 +219,33 @@ def _resize_cap(image: np.ndarray) -> np.ndarray:
 # Public API
 # ---------------------------------------------------------------------------
 
-def clean_document(image_bytes: bytes) -> bytes:
+def clean_document(image_bytes: bytes) -> tuple[bytes, bool]:
     """
-    Takes raw photo bytes → returns cleaned PNG bytes, CamScanner style.
+    Takes raw photo bytes → returns (cleaned_PNG_bytes, letter_detected).
 
-    Crop strategy (tries each in order until one works):
+    letter_detected = True  → letter was found and cropped cleanly
+    letter_detected = False → letter not found (too far, out of frame)
+                              caller should send a feedback voice message
+
+    Crop strategy (tries each in order):
       1. Edge-based contour detection — best for angled/tilted papers
       2. Brightness-based segmentation — fallback for flat photos with background
-      3. Full frame enhancement — last resort if paper fills most of frame
+      3. Full frame — last resort (letter_detected = False)
     """
     arr   = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Could not decode image")
 
-    # 1. Try edge-based detection (handles tilted/angled documents)
+    letter_detected = False
+
+    # 1. Edge-based detection
     contour = _find_document_contour(image)
     if contour is not None:
         working = _warp(image, contour)
+        letter_detected = True
     else:
-        # 2. Fallback: brightness segmentation (white paper on dark table)
+        # 2. Brightness-based fallback
         bright_box = _find_document_by_brightness(image)
         if bright_box is not None:
             pts = _order_points(bright_box)
@@ -248,11 +255,12 @@ def clean_document(image_bytes: bytes) -> bytes:
             x2 = int(max(tr[0], br[0]))
             y2 = int(max(bl[1], br[1]))
             working = image[y1:y2, x1:x2]
+            letter_detected = True
         else:
-            # 3. Last resort: process full frame
+            # 3. Last resort — process full frame, flag as not detected
             working = image
+            letter_detected = False
 
-    # Enhancement pipeline
     working = _background_divide(working)
     working = _stretch_to_white(working)
     working = _boost_contrast(working)
@@ -262,4 +270,4 @@ def clean_document(image_bytes: bytes) -> bytes:
     ok, buf = cv2.imencode(".png", working)
     if not ok:
         raise ValueError("Could not encode output image")
-    return buf.tobytes()
+    return buf.tobytes(), letter_detected
