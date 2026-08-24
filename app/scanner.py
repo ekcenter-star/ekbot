@@ -247,8 +247,7 @@ def clean_document(image_bytes: bytes) -> tuple[bytes, bool]:
         working = _warp(image, contour)
         letter_detected = True
     else:
-        # 2. Brightness fallback — still enhance what we can,
-        #    but flag as NOT detected so caller sends voice feedback.
+        # 2. Brightness fallback — if we find a bright box, we consider it a successful crop
         bright_box = _find_document_by_brightness(image)
         if bright_box is not None:
             pts = _order_points(bright_box)
@@ -258,10 +257,11 @@ def clean_document(image_bytes: bytes) -> tuple[bytes, bool]:
             x2 = int(max(tr[0], br[0]))
             y2 = int(max(bl[1], br[1]))
             working = image[y1:y2, x1:x2]
+            letter_detected = True
         else:
+            # 3. Last resort — process full frame, flag as not detected
             working = image
-        # Both brightness fallback and full-frame = letter NOT cleanly detected
-        letter_detected = False
+            letter_detected = False
 
     working = _background_divide(working)
     working = _stretch_to_white(working)
