@@ -49,20 +49,23 @@ def _bot_is_mentioned(message: Message, bot_username: str) -> bool:
     Returns True only if the bot is explicitly @mentioned in this message
     (text or caption). Uses Telegram message entities for an exact handle
     match — no substring false-positives, and no hardcoded username.
-
-    bot_username comes from context.bot.username which the Telegram API
-    fills automatically, so renaming the bot in BotFather takes effect
-    on the next restart with zero config changes.
     """
     handle = f"@{bot_username}".lower()
 
     # Entities in plain text messages
-    for mention in message.parse_entities(types=[MessageEntity.MENTION]).values():
+    text_mentions = list(message.parse_entities(types=[MessageEntity.MENTION]).values())
+    caption_mentions = list(message.parse_caption_entities(types=[MessageEntity.MENTION]).values())
+
+    logger.info(
+        "[mention-check] handle=%s | text_entities=%s | caption_entities=%s",
+        handle, text_mentions, caption_mentions
+    )
+
+    for mention in text_mentions:
         if mention.lower() == handle:
             return True
 
-    # Entities in photo / video captions
-    for mention in message.parse_caption_entities(types=[MessageEntity.MENTION]).values():
+    for mention in caption_mentions:
         if mention.lower() == handle:
             return True
 
@@ -88,22 +91,27 @@ async def handle_photo_mention(update: Update, context: ContextTypes.DEFAULT_TYP
     Handles two cases:
       A) Photo posted WITH a caption that @mentions the bot
       B) A text message that @mentions the bot is a reply to a photo message
-
-    Uses entity-based detection via context.bot.username (live from Telegram
-    API) so this works correctly regardless of the bot's registered @username.
     """
     message = update.message
     if message is None:
         return
 
-    # Read the bot's current username live from the Telegram API.
-    # This auto-updates if the bot is renamed in BotFather (after restart).
     bot_username: str = context.bot.username  # type: ignore[assignment]
+
+    logger.info(
+        "[photo-handler] chat=%s | has_photo=%s | caption=%r | text=%r | is_reply=%s",
+        update.effective_chat.id,
+        bool(message.photo),
+        message.caption,
+        message.text,
+        bool(message.reply_to_message),
+    )
 
     photo_message = None
 
     if message.photo and _bot_is_mentioned(message, bot_username):
         # Case A: photo with a caption that tags the bot
+        logger.info("[photo-handler] Trigger: Case A (photo with caption mention)")
         photo_message = message
     elif (
         message.reply_to_message
@@ -111,10 +119,12 @@ async def handle_photo_mention(update: Update, context: ContextTypes.DEFAULT_TYP
         and _bot_is_mentioned(message, bot_username)
     ):
         # Case B: text reply to a photo that tags the bot
+        logger.info("[photo-handler] Trigger: Case B (reply to photo with mention)")
         photo_message = message.reply_to_message
 
     if photo_message is None:
-        return  # not a relevant trigger, ignore silently
+        logger.info("[photo-handler] No trigger matched — ignoring message.")
+        return
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
 
