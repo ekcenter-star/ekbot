@@ -95,7 +95,51 @@ def _find_document_contour(image: np.ndarray):
                         # Scale back to original image coordinates
                         return (pts / scale).astype("float32")
 
-    return None  # Could not detect document — will process full frame
+    return None  # Could not detect document edges
+
+
+def _find_document_by_brightness(image: np.ndarray):
+    """
+    Fallback detector: white paper is the BRIGHTEST large region in the photo.
+    Uses Otsu threshold to isolate bright areas, then finds the largest one.
+    Works even when the paper has no clear edge contrast against background.
+    Returns 4 corner points or None.
+    """
+    h, w = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    # Otsu automatically picks the best threshold to separate paper from background
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Clean up noise: close small holes, remove small blobs
+    kernel = np.ones((15, 15), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN,  kernel)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    # Take the largest bright blob — that should be the paper
+    largest = max(contours, key=cv2.contourArea)
+    area    = cv2.contourArea(largest)
+    img_area = h * w
+
+    if area < 0.15 * img_area:
+        return None  # too small — probably not the document
+
+    # Get tight bounding rectangle with a tiny margin
+    rx, ry, rw, rh = cv2.boundingRect(largest)
+    pad = 10
+    rx  = max(0,     rx  - pad)
+    ry  = max(0,     ry  - pad)
+    rw  = min(w - rx, rw + pad * 2)
+    rh  = min(h - ry, rh + pad * 2)
+
+    return np.array(
+        [[rx, ry], [rx + rw, ry], [rx + rw, ry + rh], [rx, ry + rh]],
+        dtype="float32",
+    )
 
 
 def _warp(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
@@ -177,34 +221,42 @@ def _resize_cap(image: np.ndarray) -> np.ndarray:
 
 def clean_document(image_bytes: bytes) -> bytes:
     """
-    Takes raw photo bytes → returns cleaned PNG bytes, CamScanner style:
-    - Paper crops tight (perspective-warped if edges found)
-    - Background pure white
-    - Ink dark and crisp
-    - Colour preserved (stamps / logos / signatures stay in colour)
+    Takes raw photo bytes → returns cleaned PNG bytes, CamScanner style.
+
+    Crop strategy (tries each in order until one works):
+      1. Edge-based contour detection — best for angled/tilted papers
+      2. Brightness-based segmentation — fallback for flat photos with background
+      3. Full frame enhancement — last resort if paper fills most of frame
     """
     arr   = np.frombuffer(image_bytes, dtype=np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if image is None:
         raise ValueError("Could not decode image")
 
-    # 1. Deskew + crop to document
+    # 1. Try edge-based detection (handles tilted/angled documents)
     contour = _find_document_contour(image)
-    working = _warp(image, contour) if contour is not None else image
+    if contour is not None:
+        working = _warp(image, contour)
+    else:
+        # 2. Fallback: brightness segmentation (white paper on dark table)
+        bright_box = _find_document_by_brightness(image)
+        if bright_box is not None:
+            pts = _order_points(bright_box)
+            tl, tr, br, bl = pts
+            x1 = int(min(tl[0], bl[0]))
+            y1 = int(min(tl[1], tr[1]))
+            x2 = int(max(tr[0], br[0]))
+            y2 = int(max(bl[1], br[1]))
+            working = image[y1:y2, x1:x2]
+        else:
+            # 3. Last resort: process full frame
+            working = image
 
-    # 2. Remove background colour/tint
+    # Enhancement pipeline
     working = _background_divide(working)
-
-    # 3. Stretch so paper → white, ink → dark
     working = _stretch_to_white(working)
-
-    # 4. Local contrast
     working = _boost_contrast(working)
-
-    # 5. Sharpen edges
     working = _sharpen(working)
-
-    # 6. Cap size
     working = _resize_cap(working)
 
     ok, buf = cv2.imencode(".png", working)
