@@ -139,8 +139,10 @@ def _find_document_by_brightness(image: np.ndarray):
     box_area = rw * rh
     if box_area > 0.85 * img_area:
         white_pixels = cv2.countNonZero(thresh[ry:ry+rh, rx:rx+rw])
-        if white_pixels < 0.75 * box_area:
-            return None  # Lots of dark objects (e.g. keyboard) -> reject
+        # A messy table with a keyboard/hole punch will have a lot of dark pixels
+        # (e.g. 15-25%). A close-up letter is >95% white paper with only thin text.
+        if white_pixels < 0.92 * box_area:
+            return None  # More than 8% dark pixels -> messy table -> reject
 
     pad = 10
     rx  = max(0,     rx  - pad)
