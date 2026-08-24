@@ -34,32 +34,68 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
     return rect
 
 
+def _is_valid_quad(pts: np.ndarray, img_area: int) -> bool:
+    """
+    Reject quads that are clearly wrong:
+    - Too small (< 15 % of frame)
+    - Wildly non-rectangular (one angle < 45°)
+    """
+    area = cv2.contourArea(pts.reshape(4, 1, 2))
+    if area < 0.15 * img_area:
+        return False
+    # Check all 4 interior angles are between 45° and 135°
+    pts = pts.reshape(4, 2)
+    for i in range(4):
+        p0 = pts[(i - 1) % 4]
+        p1 = pts[i]
+        p2 = pts[(i + 1) % 4]
+        v1 = p0 - p1
+        v2 = p2 - p1
+        cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
+        angle = np.degrees(np.arccos(np.clip(cos_a, -1, 1)))
+        if angle < 45 or angle > 135:
+            return False
+    return True
+
+
 def _find_document_contour(image: np.ndarray):
-    """Return 4-point document contour or None."""
+    """
+    Robust document corner detection — tries multiple Canny thresholds and
+    polygon approximation levels so it works even with messy backgrounds
+    (tables, hands, legs in frame).
+    Returns a 4-point contour in original image coordinates, or None.
+    """
     h, w  = image.shape[:2]
     scale = 800.0 / max(h, w)
     small = cv2.resize(image, (int(w * scale), int(h * scale)))
 
-    gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    # Bilateral filter preserves edges better than Gaussian for contour finding
-    gray  = cv2.bilateralFilter(gray, 9, 75, 75)
-    edged = cv2.Canny(gray, 30, 120)
-    edged = cv2.dilate(edged, np.ones((5, 5), np.uint8), iterations=2)
-
-    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours     = sorted(contours, key=cv2.contourArea, reverse=True)[:8]
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 11, 75, 75)
 
     img_area = small.shape[0] * small.shape[1]
 
-    for c in contours:
-        peri  = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            area = cv2.contourArea(approx)
-            # Must cover at least 30 % of the frame
-            if area > 0.30 * img_area:
-                return (approx.reshape(4, 2) / scale).astype("float32")
-    return None
+    # Try progressively looser edge detection settings
+    canny_params   = [(30, 120), (20, 80), (50, 160), (10, 50)]
+    approx_epsilons = [0.02, 0.03, 0.05]
+
+    for lo, hi in canny_params:
+        edged = cv2.Canny(gray, lo, hi)
+        edged = cv2.dilate(edged, np.ones((5, 5), np.uint8), iterations=2)
+
+        contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        contours     = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
+
+        for c in contours:
+            peri = cv2.arcLength(c, True)
+            for eps in approx_epsilons:
+                approx = cv2.approxPolyDP(c, eps * peri, True)
+                if len(approx) == 4:
+                    pts = approx.reshape(4, 2)
+                    if _is_valid_quad(pts, img_area):
+                        # Scale back to original image coordinates
+                        return (pts / scale).astype("float32")
+
+    return None  # Could not detect document — will process full frame
 
 
 def _warp(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
