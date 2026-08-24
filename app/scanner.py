@@ -131,12 +131,16 @@ def _find_document_by_brightness(image: np.ndarray):
     # Get tight bounding rectangle
     rx, ry, rw, rh = cv2.boundingRect(largest)
 
-    # If the bounding box covers almost the entire image (> 85%), it means the
-    # background is the same color as the paper (e.g. white marble table) and we
-    # failed to isolate the letter. We should reject this so the user gets the
-    # voice feedback to retake the photo.
-    if (rw * rh) > 0.85 * img_area:
-        return None
+    # If the bounding box covers almost the entire image (> 85%), it could be:
+    # 1. A messy photo on a white marble table (table + paper = huge box)
+    # 2. A perfect close-up photo of the letter
+    # We differentiate by checking how "solid" the bright region is. A messy
+    # table will have dark holes (like a keyboard). A close-up letter is solid.
+    box_area = rw * rh
+    if box_area > 0.85 * img_area:
+        white_pixels = cv2.countNonZero(thresh[ry:ry+rh, rx:rx+rw])
+        if white_pixels < 0.75 * box_area:
+            return None  # Lots of dark objects (e.g. keyboard) -> reject
 
     pad = 10
     rx  = max(0,     rx  - pad)
