@@ -239,13 +239,16 @@ def clean_document(image_bytes: bytes) -> tuple[bytes, bool]:
 
     letter_detected = False
 
-    # 1. Edge-based detection
+    # 1. Edge-based detection — only this counts as "letter found"
+    #    Requires clear 4-corner rectangle + perspective warp.
+    #    If this fails it means the photo is too far, too messy, or out of frame.
     contour = _find_document_contour(image)
     if contour is not None:
         working = _warp(image, contour)
         letter_detected = True
     else:
-        # 2. Brightness-based fallback
+        # 2. Brightness fallback — still enhance what we can,
+        #    but flag as NOT detected so caller sends voice feedback.
         bright_box = _find_document_by_brightness(image)
         if bright_box is not None:
             pts = _order_points(bright_box)
@@ -255,11 +258,10 @@ def clean_document(image_bytes: bytes) -> tuple[bytes, bool]:
             x2 = int(max(tr[0], br[0]))
             y2 = int(max(bl[1], br[1]))
             working = image[y1:y2, x1:x2]
-            letter_detected = True
         else:
-            # 3. Last resort — process full frame, flag as not detected
             working = image
-            letter_detected = False
+        # Both brightness fallback and full-frame = letter NOT cleanly detected
+        letter_detected = False
 
     working = _background_divide(working)
     working = _stretch_to_white(working)
