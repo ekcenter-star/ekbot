@@ -32,6 +32,7 @@ from telegram.ext import (
 
 from scanner import clean_document
 from greetings import pick_greeting
+from gemini_ocr import extract_text
 
 load_dotenv()
 
@@ -133,12 +134,25 @@ async def handle_photo_mention(update: Update, context: ContextTypes.DEFAULT_TYP
         file = await context.bot.get_file(tg_photo.file_id)
         photo_bytes = bytes(await file.download_as_bytearray())
 
+        # Step 1 — clean the image with OpenCV
         cleaned_bytes = clean_document(photo_bytes)
 
-        await message.reply_photo(
+        sent = await message.reply_photo(
             photo=cleaned_bytes,
             caption="✅ Cleaned up and ready to attach in Cliniko.",
         )
+
+        # Step 2 — extract text with Gemini Pro (if API key is configured)
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        )
+        ocr_text = extract_text(photo_bytes)  # use original for best OCR accuracy
+        if ocr_text:
+            await sent.reply_text(
+                f"📝 *Extracted text:*\n\n{ocr_text}",
+                parse_mode="Markdown",
+            )
+
     except Exception:
         logger.exception("Failed to process document photo")
         await message.reply_text(
