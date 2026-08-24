@@ -128,8 +128,16 @@ def _find_document_by_brightness(image: np.ndarray):
     if area < 0.15 * img_area:
         return None  # too small — probably not the document
 
-    # Get tight bounding rectangle with a tiny margin
+    # Get tight bounding rectangle
     rx, ry, rw, rh = cv2.boundingRect(largest)
+
+    # If the bounding box covers almost the entire image (> 85%), it means the
+    # background is the same color as the paper (e.g. white marble table) and we
+    # failed to isolate the letter. We should reject this so the user gets the
+    # voice feedback to retake the photo.
+    if (rw * rh) > 0.85 * img_area:
+        return None
+
     pad = 10
     rx  = max(0,     rx  - pad)
     ry  = max(0,     ry  - pad)
